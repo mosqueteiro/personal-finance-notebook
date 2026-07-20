@@ -1,0 +1,221 @@
+-- allium: 3
+-- finance-notebook.allium
+
+-- Scope: Personal Finance Operations Center (v1 MVP)
+-- Includes: Account liquidity tracking, transaction ingestion from files, transaction categorization, ledger filtering, budget pacing.
+-- Excludes:
+--   - Direct API connections to banks (Plaid, etc.)
+--   - Real-time stock/crypto price scraping
+--   - Multi-user authentication or state
+--   - Advanced ML auto-categorization (deferred to v2)
+
+--------------------------------------------------------------------------------
+-- Actors
+--------------------------------------------------------------------------------
+
+actor User {
+    -- The sole owner of the financial data and system.
+}
+
+--------------------------------------------------------------------------------
+-- Enums & Value Types
+--------------------------------------------------------------------------------
+
+enum TransactionType {
+    income
+    expense
+}
+
+enum BudgetPeriod {
+    monthly
+    yearly
+}
+
+enum StatementFormat {
+    csv
+    pdf
+}
+
+enum StatementStatus {
+    uploaded
+    extracted
+    confirmed
+    rejected
+}
+
+enum TransactionStatus {
+    pending_confirmation
+    confirmed
+    rejected
+}
+
+--------------------------------------------------------------------------------
+-- Entities
+--------------------------------------------------------------------------------
+
+entity Category {
+    name: string
+    created_at: timestamp
+}
+
+entity Account {
+    name: string
+    institution: string
+    -- Configured by the user per account to trigger liquidity alerts.
+    low_balance_threshold: float
+    current_balance: float
+    created_at: timestamp
+
+    -- Derived values for quick liquidity checks
+    is_low_balance: bool = current_balance < low_balance_threshold
+}
+
+entity AccountStatement {
+    account: Account
+    file_name: string
+    format: StatementFormat
+    status: StatementStatus
+    uploaded_at: timestamp
+    -- Extracted bounds, can be derived later once transactions are processed
+    start_date: timestamp?
+    end_date: timestamp?
+}
+
+entity Transaction {
+    account: Account
+    statement: AccountStatement?
+    status: TransactionStatus
+    date: timestamp
+    amount: float
+    type: TransactionType
+    merchant: string
+    description: string?
+    category: Category?
+    created_at: timestamp
+}
+
+entity CategorizationRule {
+    -- Basic rule: if merchant contains a keyword, assign a category.
+    merchant_keyword: string
+    target_category: Category
+    created_at: timestamp
+}
+
+entity Budget {
+    name: string
+    -- A budget might be for a specific category, or overall. If category is null, it's total spending.
+    target_category: Category?
+    amount: float
+    period: BudgetPeriod
+    created_at: timestamp
+}
+
+--------------------------------------------------------------------------------
+-- Rules
+--------------------------------------------------------------------------------
+
+-- External system/black box for categorizing transactions
+external entity Categorizer {
+    -- The actual matching algorithm is an implementation detail (regex, keywords, ML)
+}
+
+-- Happy Path: Ingestion and Extraction
+rule StatementExtracted {
+    when: statement: AccountStatement.transitions_to(status: extracted)
+    -- The extraction process produces transactions that need confirmation
+    ensures: Transaction.created(
+        statement: statement,
+        account: statement.account,
+        status: pending_confirmation
+    )
+}
+
+rule StatementConfirmed {
+    when: statement: AccountStatement.transitions_to(status: confirmed)
+    -- All transactions in this statement become confirmed
+    ensures: Transaction.updated(
+        status: confirmed
+    )
+}
+
+-- Edge Case: User rejects the extracted statement
+rule StatementRejected {
+    when: statement: AccountStatement.transitions_to(status: rejected)
+    -- All pending transactions in this statement are rejected
+    ensures: Transaction.updated(
+        status: rejected
+    )
+}
+
+-- Happy Path: Categorization
+rule AutoCategorizeTransaction {
+    when: transaction: Transaction.created()
+    -- Apply matching logic to suggest a category based on the merchant
+    ensures: transaction.updated(
+        category: Categorizer.match(
+            merchant: transaction.merchant,
+            rules: CategorizationRule
+        )
+    )
+}
+
+--------------------------------------------------------------------------------
+-- Surfaces (User Actions)
+--------------------------------------------------------------------------------
+
+surface DataIngestion {
+    provides: User.upload_statement(account: Account, file: string, format: StatementFormat) {
+        ensures: AccountStatement.created(
+            account: account,
+            file_name: file,
+            format: format,
+            status: uploaded,
+            uploaded_at: now
+        )
+    }
+
+    provides: User.confirm_statement(statement: AccountStatement) {
+        requires: statement.status == extracted
+        ensures: statement.updated(status: confirmed)
+    }
+
+    provides: User.reject_statement(statement: AccountStatement) {
+        requires: statement.status == extracted
+        ensures: statement.updated(status: rejected)
+    }
+}
+
+surface CategorizationManagement {
+    provides: User.create_rule(keyword: string, target: Category) {
+        ensures: CategorizationRule.created(
+            merchant_keyword: keyword,
+            target_category: target,
+            created_at: now
+        )
+    }
+
+    provides: User.reapply_rules(transactions: Transaction) {
+        -- Manual trigger to re-run the categorizer over selected transactions
+        ensures: transactions.updated(
+            category: Categorizer.match(
+                merchant: transactions.merchant,
+                rules: CategorizationRule
+            )
+        )
+    }
+}
+
+surface BudgetAndPacing {
+    -- The notebook allows the user to view budget pacing for any arbitrary window
+    -- so we expose the necessary data rather than hardcoding state machines for periods.
+    exposes: Budget
+    exposes: Transaction where status == confirmed
+    exposes: Account
+
+    provides: User.view_pacing(start_date: timestamp, end_date: timestamp) {
+        -- A read-only action representing the 5-Minute Weekly Status Check
+        @guarantee "User sees total spending vs budget for the selected period"
+        @guarantee "User sees category-specific spending vs budget for the selected period"
+        @guarantee "User sees alerts for any accounts where is_low_balance is true"
+    }
+}
