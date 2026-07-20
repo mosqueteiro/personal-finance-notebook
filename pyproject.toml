@@ -1,0 +1,12 @@
+[project]
+name = "personal-finance-notebook"
+version = "0.1.0"
+description = "a Marimo notebook for personal finance operations."
+requires-python = ">=3.14"
+dependencies = [
+  "marimo",
+  "duckdb",
+]
+
+[tool.uv]
+package = false
