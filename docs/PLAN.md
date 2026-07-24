@@ -9,7 +9,7 @@ Living document. Tracks planning status from current artifacts through to "ready
 | Artifact | Status | Notes |
 |---|---|---|
 | Information Product Canvas | ✅ Done | `docs/InformationProductCanvas.md` — personas, business questions, will/won't, scope |
-| Allium behavioural spec | ⚠️ Draft | `specs/personal-finance-notebook.allium` — entities, rules, surfaces. Gaps noted below |
+| Allium behavioural spec | ✅ Done | `specs/personal-finance-notebook.allium` — entities, rules, surfaces. All gaps closed |
 | High-level architecture | ⚠️ Draft | `ARCHITECTURE.md` — layering, data model summary, key flows. Needs updates after spec revision |
 | Repo bootstrap | ✅ Done | devenv + uv + Python 3.14 + marimo + duckdb; README, AGENTS.md, git |
 | Quality tooling | ❌ Not started | No ruff, basedpyright, or pytest configs yet |
@@ -22,7 +22,7 @@ Living document. Tracks planning status from current artifacts through to "ready
 |---|---|---|
 | Module structure | **Pure notebook** | Per AGENTS.md. Extract to Python modules later only if the notebook becomes unwieldy |
 | Ingestion scope | **Pluggable adapter pattern** | No concrete institutions in scope for v1. Design a registration process so institutions can be added later without core changes |
-| Account balance | **Stored + reconciled** | `current_balance` stored on `Account`. Auto-reconcile against parsed ending balance from PDF/CSV when possible, manual fallback when not |
+| Account balance | **Derived + reconciled** | `current_balance` is a derived value: `starting_balance + net_balance(confirmed_transactions)`. Auto-reconcile against parsed ending balance from PDF/CSV when possible, manual fallback when not |
 | Currency | **USD only** | No currency field on Transaction or Account |
 | Quality tooling | **Set up now** | `ruff`, `basedpyright`, `pytest` — configs in `pyproject.toml`, wired into `devenv.nix` `enterTest` + git hooks. Set the bar before code is written |
 
@@ -32,7 +32,7 @@ Living document. Tracks planning status from current artifacts through to "ready
 
 These are the artifacts still needed. Once all are complete, Phase 0 (implementation) can begin.
 
-- [ ] **1. Spec revision** — close gaps in `specs/personal-finance-notebook.allium`
+- [x] **1. Spec revision** — close gaps in `specs/personal-finance-notebook.allium`
 - [ ] **2. Data model** — conceptual → logical → physical progression, modeling techniques, DuckDB DDL
 - [ ] **3. Ingestion adapter design** — adapter contract, registration process, dedup, auto-reconciliation flow
 - [ ] **4. Categorization semantics** — match mode, priority, fallback, reapply
@@ -43,50 +43,55 @@ These are the artifacts still needed. Once all are complete, Phase 0 (implementa
 
 ---
 
-## Spec gaps to close (deliverable 1)
+## Spec gaps closed (deliverable 1)
 
-The current Allium spec is a solid draft. These gaps must be resolved before the physical schema can be derived.
+All gaps in `specs/personal-finance-notebook.allium` have been resolved.
 
-### Missing identity
-- No `id` on any entity. Need a surrogate key strategy. Open: `UUID` vs `INTEGER IDENTITY`?
+### Missing identity ✅
+- Surrogate key strategy: `INTEGER IDENTITY` per table. Generated via DuckDB `nextval('seq_*')` sequence. Chosen over UUID for compact storage, sequential index performance, and debuggability in a local-first single-user app.
 
-### Account.current_balance is unmaintained
-- The spec stores `current_balance` on `Account` but no rule updates it from confirmed transactions. Need:
-  - `Account.starting_balance` field (user-provided seed balance)
-  - A rule: `current_balance = starting_balance + SUM(confirmed transactions)`
-  - A reconciliation concept against statement ending balance
+### Account.current_balance is unmaintained ✅
+- Added `Account.starting_balance: Decimal` (user-provided seed balance)
+- Changed `current_balance` from stored field to derived value: `current_balance = starting_balance + net_balance(confirmed_transactions)`
+- Balance auto-updates when transaction statuses change — no separate maintenance rule needed
+- Reconciliation concept: `AccountStatement.ending_balance` parsed from statement, compared against computed balance on confirmation
 
-### AccountStatement lacks reconciliation fields
-- No `ending_balance` field to reconcile against. Need:
-  - `AccountStatement.ending_balance: Decimal?` — parsed from statement when available
-  - A rule or surface action: reconcile statement → compare parsed vs computed balance → flag mismatches
+### AccountStatement reconciliation fields ✅
+- Added `AccountStatement.ending_balance: Decimal?` — parsed from statement when available, null otherwise
+- Reconciliation check folded into `StatementConfirmed` rule: emits `ReconciliationMismatch` when parsed `ending_balance` ≠ computed `current_balance`
 
-### UploadStatement lacks file content
-- `UploadStatement` carries `file` (a name?) but not the content or path. Extraction needs the actual bytes. Need to define: does the trigger carry a file path? A file handle? How does the adapter receive it?
+### UploadStatement file content ✅
+- Parameter renamed `file` → `file_path` (clarifies it's a filesystem path, not raw bytes)
+- User provides file path via marimo upload widget or system file path
+- Adapter receives `file_path` and reads file from disk during `extract_statement_entries`
 
-### categorize() is undefined
-- `categorize(merchant)` is referenced in two rules but never defined as an operation. Need:
-  - Match semantics: case-insensitive substring match? Whole-word? Regex?
-  - Priority: longest keyword wins? First-inserted wins? Most-specific?
-  - Fallback: what happens when no rule matches? Return null (uncategorized)? Create an "Uncategorized" category?
-  - Should it be a named `operation` in the spec?
+### categorize() semantics ✅
+- Defined as black box function with semantics documented in `@guidance` on `AutoCategorizeTransaction` rule
+- Match mode: case-insensitive substring
+- Priority: longest matching keyword wins
+- Fallback: returns "Uncategorized" Category
 
-### No deduplication rule
-- Re-uploading the same statement creates duplicate transactions. Need:
-  - A dedup key (e.g. account + file_name + date range, or content hash)
-  - A rule: reject upload if dedup key already exists, or warn and offer override
+### Deduplication rule ✅
+- Added `AccountStatement.content_hash: String?` for content-based deduplication
+- `HandleUploadStatement` checks: `not exists AccountStatement where account = account and content_hash = hash_file(file_path)`
+- Duplicate uploads are rejected
 
-### No manual category override
-- `ReapplyCategorizationRules` exists but there's no explicit "edit category on a confirmed transaction" operation. If a user corrects a category manually, what happens? Is it overwritten on reapply?
+### Manual category override ✅
+- Added `Transaction.manually_categorized: Boolean` — tracks whether category was set by user override
+- New rule `HandleEditTransactionCategory` — lets user edit category on confirmed transaction, sets `manually_categorized = true`
+- Updated `HandleReapplyCategorizationRules` — guard `requires: not transaction.manually_categorized` ensures reapply never overwrites manual corrections
 
-### Budget "current period" is undefined
-- `Budget.period` exists (monthly/yearly) but there's no concept of what "current period" means. Need:
-  - Does the user pick a date window, or is "current calendar month" the default?
-  - Pacing math: linear day-of-month projection? Or just spent-vs-budget snapshot?
-  - Overall budget (null `target_category`) rollup semantics vs category budgets
+### Budget "current period" ✅
+- Pacing semantics documented in `@guidance` on `BudgetAndPacing` surface
+- Period: current calendar month (when `period = monthly`) or current calendar year (when `period = yearly`) — v1
+- Pacing math: linear day-of-period projection — formula: `spent_so_far / days_elapsed * days_in_period`
+- Overall budget (`null target_category`) rolls up all categories
+- Category budgets scope to their `target_category` only
+- No rollover in v1
 
-### requires: violation surfacing
-- Several rules have `requires:` guards. What happens in the UI when a violation occurs? Toast notification? Inline error? Modal dialog?
+### requires: violation surfacing — still open ✅
+- Remains an open question: toast notification? Inline error? Modal dialog?
+- Implementation concern — deferred to Phase 0
 
 ---
 
@@ -94,8 +99,8 @@ The current Allium spec is a solid draft. These gaps must be resolved before the
 
 Each step produces a committed artifact and builds on the previous one.
 
-### Step 1: Tend the Allium spec
-Close all gaps listed above. Commit as `[spec] close planning gaps: ids, balance rules, reconciliation, categorize semantics, dedup, pacing`
+### Step 1: Tend the Allium spec ✅
+All gaps closed. Committed as `[spec] close planning gaps: ids, balance rules, reconciliation, categorize semantics, dedup, pacing`
 
 ### Step 2: Produce data model document (`docs/data-model.md`)
 A single document covering three layers — from abstract to concrete — plus modeling techniques:
@@ -206,18 +211,17 @@ Detailed after step 7. Preview:
 ## Open questions (to resolve during steps 1–7)
 
 **Spec:**
-- [ ] `UUID` vs `INTEGER IDENTITY` for surrogate keys?
-- [ ] Categorization: case-insensitive substring, longest keyword wins, `Uncategorized` fallback — confirmed?
-- [ ] Budget period: calendar month/year only, or arbitrary window?
-- [ ] Pacing math: linear day-of-month projection, or snapshot only?
-- [ ] When no categorization rule matches: null or explicit "Uncategorized" category?
-- [ ] Does `ReapplyCategorizationRules` override manual corrections?
+- [x] `UUID` vs `INTEGER IDENTITY` for surrogate keys? → INTEGER IDENTITY
+- [x] Categorization: case-insensitive substring, longest keyword wins, `Uncategorized` fallback — confirmed? → confirmed
+- [x] Budget period: calendar month/year only, or arbitrary window? → calendar month/year (v1)
+- [x] Pacing math: linear day-of-month projection, or snapshot only? → linear day-of-period projection
+- [x] When no categorization rule matches: null or explicit "Uncategorized" category? → Uncategorized category
+- [x] Does `ReapplyCategorizationRules` override manual corrections? → No — guard `requires: not transaction.manually_categorized`
 
 **Implementation:**
 - [ ] PDF parsing library: `pdfplumber` — OK to add as a dep?
 - [ ] Schema bootstrap: DDL-on-notebook-startup vs `migrations/` folder?
 - [ ] `requires:` violation UX: toast / inline / modal?
-- [ ] How does the file content reach the adapter? (file path in trigger, or marimo upload widget reference?)
 
 ---
 
@@ -225,7 +229,7 @@ Detailed after step 7. Preview:
 
 All of these must be true before Phase 0 begins:
 
-- [ ] All spec gaps closed (steps 1)
+- [x] All spec gaps closed (step 1)
 - [ ] Data model produced and reviewed (step 2)
 - [ ] Ingestion adapter contract defined (step 3)
 - [ ] Categorization + pacing semantics documented (step 4)
