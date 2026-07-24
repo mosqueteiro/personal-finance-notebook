@@ -1,4 +1,10 @@
-{ pkgs, lib, config, inputs, ... }:
+{
+  pkgs,
+  lib,
+  config,
+  inputs,
+  ...
+}:
 
 {
   # https://devenv.sh/packages/
@@ -17,7 +23,7 @@
 
   # https://devenv.sh/processes/
   # `devenv up` launches the Marimo editor.
-  processes.marimo.exec = "marimo edit";
+  # processes.marimo.exec = "marimo edit";
 
   # https://devenv.sh/tests/
   enterTest = ''
