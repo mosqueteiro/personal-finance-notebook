@@ -23,6 +23,8 @@ enum StatementStatus { uploaded | extracted | confirmed | rejected }
 
 enum TransactionStatus { pending_confirmation | confirmed | rejected }
 
+enum AccountStatus { active | closed }
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -35,11 +37,22 @@ entity Category {
 entity Account {
     name: String
     institution: String
+    status: AccountStatus
+    starting_balance: Decimal
     low_balance_threshold: Decimal
-    current_balance: Decimal
     created_at: Timestamp
 
+    transactions: Transaction with account = this
+    confirmed_transactions: transactions where status = confirmed
+
+    current_balance: Decimal = starting_balance + net_balance(confirmed_transactions)
     is_low_balance: Boolean = current_balance < low_balance_threshold
+
+    transitions status {
+        active -> closed
+        closed -> active
+        terminal: none
+    }
 }
 
 entity AccountStatement {
@@ -50,6 +63,8 @@ entity AccountStatement {
     uploaded_at: Timestamp
     start_date: Timestamp?
     end_date: Timestamp?
+    content_hash: String?
+    ending_balance: Decimal?
 
     transactions: Transaction with statement = this
 
@@ -71,6 +86,7 @@ entity Transaction {
     merchant: String
     description: String?
     category: Category?
+    manually_categorized: Boolean
     created_at: Timestamp
 
     transitions status {
@@ -99,13 +115,15 @@ entity Budget {
 ------------------------------------------------------------
 
 rule HandleUploadStatement {
-    when: UploadStatement(account, file, format)
+    when: UploadStatement(account, file_path, format)
+    requires: not exists AccountStatement where account = account and content_hash = hash_file(file_path)
     ensures: AccountStatement.created(
         account: account,
-        file_name: file,
+        file_name: file_path,
         format: format,
         status: uploaded,
-        uploaded_at: now
+        uploaded_at: now,
+        content_hash: hash_file(file_path)
     )
 }
 
@@ -128,7 +146,8 @@ rule StatementExtracted {
                 type: entry.type,
                 merchant: entry.merchant,
                 description: entry.description,
-                status: pending_confirmation
+                status: pending_confirmation,
+                manually_categorized: false
             )
 }
 
@@ -143,6 +162,10 @@ rule StatementConfirmed {
     for t in statement.transactions:
         requires: t.status = pending_confirmation
         ensures: t.status = confirmed
+    let computed_balance = statement.account.current_balance
+    ensures:
+        if statement.ending_balance != null and statement.ending_balance != computed_balance:
+            ReconciliationMismatch(statement, statement.ending_balance, computed_balance)
 }
 
 rule HandleRejectStatement {
@@ -162,6 +185,11 @@ rule AutoCategorizeTransaction {
     when: transaction: Transaction.created
     requires: transaction.category = null
     ensures: transaction.category = categorize(transaction.merchant)
+
+    @guidance
+        -- categorize(merchant) is a black box function that applies CategorizationRules
+        -- to the merchant string. Match mode: case-insensitive substring.
+        -- Priority: longest matching keyword wins. Fallback: returns "Uncategorized" Category.
 }
 
 rule HandleCreateCategorizationRule {
@@ -176,7 +204,28 @@ rule HandleCreateCategorizationRule {
 rule HandleReapplyCategorizationRules {
     when: ReapplyCategorizationRules(transaction)
     requires: transaction.status = confirmed
+    requires: not transaction.manually_categorized
     ensures: transaction.category = categorize(transaction.merchant)
+}
+
+rule HandleEditTransactionCategory {
+    when: EditTransactionCategory(transaction, category)
+    requires: transaction.status = confirmed
+    ensures:
+        transaction.category = category
+        transaction.manually_categorized = true
+}
+
+rule HandleCloseAccount {
+    when: CloseAccount(account)
+    requires: account.status = active
+    ensures: account.status = closed
+}
+
+rule HandleReopenAccount {
+    when: ReopenAccount(account)
+    requires: account.status = closed
+    ensures: account.status = active
 }
 
 ------------------------------------------------------------
@@ -204,7 +253,7 @@ surface DataIngestion {
             s.uploaded_at
 
     provides:
-        UploadStatement(user, account, file, format)
+        UploadStatement(user, account, file_path, format)
         ExtractStatement(user, statement)
             when statement.status = uploaded
         ConfirmStatement(user, statement)
@@ -225,7 +274,28 @@ surface CategorizationManagement {
 
     provides:
         CreateCategorizationRule(user, keyword, category)
+        EditTransactionCategory(user, transaction, category)
         ReapplyCategorizationRules(user, transaction)
+}
+
+surface AccountManagement {
+    facing user: User
+
+    let accounts = Accounts
+
+    exposes:
+        for a in accounts:
+            a.name
+            a.institution
+            a.starting_balance
+            a.current_balance
+            a.status
+
+    provides:
+        CloseAccount(user, account)
+            when account.status = active
+        ReopenAccount(user, account)
+            when account.status = closed
 }
 
 surface BudgetAndPacing {
@@ -233,7 +303,7 @@ surface BudgetAndPacing {
 
     let budgets = Budgets
     let confirmed_transactions = Transactions where status = confirmed
-    let accounts = Accounts
+    let accounts = Accounts where status = active
 
     exposes:
         for b in budgets:
@@ -258,4 +328,19 @@ surface BudgetAndPacing {
 
     @guarantee LowBalanceAlerts
         -- User sees alerts for any accounts where is_low_balance is true.
+
+    @guidance
+        -- Budget period: current calendar month when period = monthly,
+        -- current calendar year when period = yearly (v1).
+        -- Pacing math: linear day-of-period projection.
+        -- Formula: spent_so_far / days_elapsed * days_in_period.
+        -- Overall budget (null target_category) rolls up all categories.
+        -- Category budgets scope to their target_category only.
+        -- No rollover in v1.
 }
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "requires: violation UX — toast notification, inline error, or modal dialog?"
